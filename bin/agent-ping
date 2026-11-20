@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Local event sender. No network listener, credentials, or global hook changes."""
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from urllib.parse import urlsplit
+
+ROOT = Path(__file__).resolve().parent.parent
+APP = ROOT / "dist/AgentPing.app"
+KINDS = {"done", "question", "error", "turn-complete"}
+TITLES = {"done": "任务已完成", "question": "需要你处理", "error": "任务遇到错误", "turn-complete": "Codex 一轮回复已结束"}
+SOURCE_APPS = {"codex": "com.openai.codex", "dsh": "com.deepseek.dsh",
+               "deepseek harness": "com.deepseek.dsh", "deepseek-harness": "com.deepseek.dsh",
+               "飞书": "com.electron.lark", "飞书机器人": "com.electron.lark",
+               "lark": "com.electron.lark", "feishu": "com.electron.lark"}
+
+
+def data_root():
+    return Path(os.environ.get("AGENTPING_DATA_DIR", str(Path.home() / "Library/Application Support/AgentPing")))
+
+
+def validate(event):
+    limits = {"id": 200, "source": 100, "title": 160, "message": 8000}
+    if event.get("kind") not in KINDS:
+        raise ValueError("不支持的事件类型")
+    for key, limit in limits.items():
+        value = event.get(key)
+        if not isinstance(value, str) or len(value) > limit or (key != "message" and not value.strip()):
+            raise ValueError(f"{key} 无效或超过 {limit} 字符")
+    if not isinstance(event.get("createdAt"), str):
+        raise ValueError("缺少 createdAt")
+    app = event.get("appBundleId")
+    if app is not None and (not isinstance(app, str) or len(app) > 255 or
+                            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+", app) is None):
+        raise ValueError("来源应用必须使用有效的 macOS bundle identifier")
+    url = event.get("url")
+    if url is not None:
+        if not isinstance(url, str) or len(url) > 4096:
+            raise ValueError("任务链接无效")
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in {"https", "http", "codex", "lark", "feishu"} or parsed.username or parsed.password:
+            raise ValueError("仅支持 http(s)、codex、lark、feishu 任务链接；禁止嵌入凭据")
+        if parsed.scheme.lower() in {"https", "http"} and not parsed.hostname:
+            raise ValueError("任务链接缺少主机名")
+    return event
+
+
+def make_event(kind, source, message, title=None, url=None, event_id=None, app_bundle_id=None):
+    return validate({"id": event_id or str(uuid.uuid4()), "kind": kind, "source": source,
+                     "title": title or TITLES[kind], "message": message, "url": url,
+                     "appBundleId": app_bundle_id if app_bundle_id is not None else SOURCE_APPS.get(source.strip().lower()),
+                     "createdAt": dt.datetime.now(dt.timezone.utc).isoformat()})
+
+
+def codex_event(raw):
+    """A finished turn is not a claim that the entire task is finished."""
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("Codex 载荷必须是 JSON 对象")
+    if payload.get("type") != "agent-turn-complete":
+        return None
+    thread = payload.get("thread-id", "")
+    turn = payload.get("turn-id", "")
+    if not isinstance(thread, str) or not isinstance(turn, str):
+        raise ValueError("Codex thread-id / turn-id 必须为字符串")
+    # Do not copy prompts, assistant replies, cwd, or other session content.
+    identity = "codex:" + hashlib.sha256(f"{thread}:{turn}".encode()).hexdigest() if thread and turn else None
+    return make_event("turn-complete", "Codex", "一轮回复已经结束，请回到 Codex 查看结果。", event_id=identity)
+
+
+def prepare_dirs(root):
+    for name in ["", "inbox", "receipts", "rejected"]:
+        path = root / name
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.chmod(0o700)
+
+
+def enqueue(event, root):
+    validate(event)
+    prepare_dirs(root)
+    filename = hashlib.sha256(event["id"].encode()).hexdigest() + ".json"
+    target = root / "inbox" / filename
+    if (root / "receipts" / filename).exists():
+        return False
+    fd, temp = tempfile.mkstemp(prefix=".event-", dir=str(root / "inbox"))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(event, output, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temp, target)  # Atomic create; concurrent retries never overwrite.
+            return True
+        except FileExistsError:
+            return False
+    finally:
+        os.unlink(temp)
+
+
+def app_running(root):
+    try:
+        with (root / "app.lock").open("r+") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def launch_app(root):
+    if app_running(root):
+        return
+    binary = APP / "Contents/MacOS/AgentPing"
+    if not binary.is_file():
+        raise ValueError("请先运行 scripts/build，或使用 --prototype 测试 Swift 脚本")
+    prepare_dirs(root)
+    with (root / "app.log").open("a", encoding="utf-8") as log:
+        os.chmod(root / "app.log", 0o600)
+        subprocess.Popen([str(binary), "--app"], stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=log, start_new_session=True)
+
+
+def prototype(event, timeout):
+    work = ROOT / "work"
+    work.mkdir(exist_ok=True)
+    fd, raw_path = tempfile.mkstemp(prefix="prototype-", suffix=".json", dir=str(work))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(event, output, ensure_ascii=False)
+        return subprocess.run(["/usr/bin/swift", str(ROOT / "Sources/main.swift"),
+                               "--event", raw_path, "--timeout", str(timeout)]).returncode
+    finally:
+        Path(raw_path).unlink(missing_ok=True)
+
+
+def parser():
+    result = argparse.ArgumentParser(description="AgentPing：macOS 本地强提醒")
+    sub = result.add_subparsers(dest="command", required=True)
+    for command in ["done", "question", "error", "demo", "codex"]:
+        p = sub.add_parser(command)
+        if command == "codex":
+            p.add_argument("payload", help="Codex notify 传入的 JSON 参数")
+        else:
+            p.add_argument("--source", default="AgentPing 测试" if command == "demo" else "本地任务")
+            p.add_argument("--message", default="请检查全屏时是否能看到这条提醒，原应用的输入是否正常。" if command == "demo" else "")
+            p.add_argument("--title")
+            p.add_argument("--url")
+            p.add_argument("--id", dest="event_id")
+        if command == "demo":
+            p.add_argument("--kind", choices=["done", "question", "error"], default="question")
+        p.add_argument("--dry-run", action="store_true", help="仅输出事件，不写队列、不弹窗")
+        p.add_argument("--app", dest="app_bundle_id", help="点击确定后返回的应用 bundle identifier")
+        p.add_argument("--prototype", action="store_true", help="直接运行 Swift 脚本，确认后退出")
+        p.add_argument("--delay", type=float, default=0, help="延迟秒数，方便先进入全屏")
+        p.add_argument("--timeout", type=float, default=0, help="仅供脚本测试：自动退出秒数；0 为持续显示")
+    sub.add_parser("start", help="启动原生菜单栏应用，不生成提醒")
+    sub.add_parser("status", help="读取应用状态和待处理数量")
+    return result
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    root = data_root()
+    if args.command == "status":
+        print(json.dumps({"appRunning": app_running(root), "appBuilt": APP.is_dir(),
+                          "pending": len(list((root / "inbox").glob("*.json"))),
+                          "dataDirectory": str(root)}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "start":
+        launch_app(root)
+        print("AgentPing 已启动")
+        return 0
+    if not 0 <= args.delay <= 3600 or not 0 <= args.timeout <= 3600:
+        raise ValueError("delay / timeout 必须在 0 到 3600 秒之间")
+    if args.timeout and not args.prototype:
+        raise ValueError("--timeout 仅适用于 --prototype")
+    event = codex_event(args.payload) if args.command == "codex" else make_event(
+        args.kind if args.command == "demo" else args.command,
+        args.source, args.message, args.title, args.url, args.event_id, args.app_bundle_id)
+    if event is None:
+        print("忽略不支持的 Codex 事件")
+        return 0
+    if args.command == "codex" and args.app_bundle_id is not None:
+        event = validate({**event, "appBundleId": args.app_bundle_id})
+    if args.dry_run:
+        print(json.dumps(event, ensure_ascii=False, indent=2))
+        return 0
+    if args.delay:
+        print(f"将在 {args.delay:g} 秒后发送测试提醒" if args.command == "demo" else f"将在 {args.delay:g} 秒后发送提醒", flush=True)
+        time.sleep(args.delay)
+    if args.prototype:
+        return prototype(event, args.timeout)
+    if not APP.is_dir():
+        raise ValueError("请先运行 scripts/build，或使用 --prototype")
+    queued = enqueue(event, root)
+    launch_app(root)
+    print("提醒已加入本地队列" if queued else "已忽略重复提醒")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        print(f"AgentPing: {error}", file=sys.stderr)
+        raise SystemExit(1)

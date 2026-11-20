@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+project_dir="$(cd "$(dirname "$0")/.." && pwd)"
+build_dir="$(/usr/bin/getconf DARWIN_USER_CACHE_DIR)AgentPing/build"
+app_dir="$build_dir/AgentPing.app"
+app_link="$project_dir/dist/AgentPing.app"
+if [ -e "$app_link" ] && [ ! -L "$app_link" ]; then
+  printf 'Build entry already exists as a real directory: %s\n' "$app_link" >&2
+  exit 1
+fi
+mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources" "$project_dir/work" "$project_dir/dist"
+/usr/bin/swiftc -O -framework AppKit "$project_dir/Sources/main.swift" -o "$project_dir/work/AgentPing"
+install -m 755 "$project_dir/work/AgentPing" "$app_dir/Contents/MacOS/AgentPing"
+python3 - "$app_dir/Contents/Info.plist" <<'PY'
+import plistlib
+import sys
+with open(sys.argv[1], 'wb') as output:
+    plistlib.dump({
+        'CFBundleExecutable': 'AgentPing',
+        'CFBundleIdentifier': 'local.agentping.app',
+        'CFBundleName': 'AgentPing',
+        'CFBundleDisplayName': 'AgentPing',
+        'CFBundlePackageType': 'APPL',
+        'CFBundleShortVersionString': '0.1.0',
+        'CFBundleVersion': '1',
+        'LSMinimumSystemVersion': '13.0',
+        'LSUIElement': True,
+        'NSHighResolutionCapable': True,
+    }, output)
+PY
+# Keep the signed bundle outside File Provider / cloud-synced source folders.
+/usr/bin/xattr -cr "$app_dir"
+/usr/bin/codesign --force --sign - "$app_dir"
+/usr/bin/codesign --verify --deep --strict "$app_dir"
+ln -sfn "$app_dir" "$app_link"
+printf 'Built: %s\nProject entry: %s\n' "$app_dir" "$app_link"

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Install only the authorized Codex and DSH adapters, preserving other hooks."""
+import argparse
+import datetime as dt
+import hashlib
+import json
+from pathlib import Path
+import re
+import shlex
+import shutil
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+RECEIVER = ROOT / "integrations/receive.py"
+CODEX_PATH = Path.home() / ".codex/hooks.json"
+DSH_PATH = Path.home() / ".dsh/profiles/desktop/cordis.patch.yml"
+BACKUPS = Path.home() / "Library/Application Support/AgentPing/integration-backups"
+MODULES = BACKUPS.parent / "dsh-modules"
+BEGIN = "# BEGIN AgentPing notifications (managed by AgentPing)"
+END = "# END AgentPing notifications"
+
+
+def codex_groups():
+    command = shlex.join([sys.executable, str(RECEIVER), "codex"])
+    handler = {"type": "command", "command": command, "timeout": 5,
+               "statusMessage": "AgentPing 任务提醒"}
+    return {"Stop": {"hooks": [handler]}, "PermissionRequest": {"hooks": [handler]},
+            "PreToolUse": {"matcher": r"(^|[._])(request_user_input(_async)?|ask_user_question)$", "hooks": [handler]}}
+
+
+def merge_codex(document, install=True):
+    if not isinstance(document, dict) or not isinstance(document.get("hooks", {}), dict):
+        raise ValueError("现有 Codex hooks.json 格式无效，未修改")
+    result = json.loads(json.dumps(document))
+    hooks = result.setdefault("hooks", {})
+    for event, groups in list(hooks.items()):
+        cleaned = []
+        for group in groups:
+            kept = [h for h in group.get("hooks", []) if str(RECEIVER) not in h.get("command", "")]
+            if kept:
+                cleaned.append({**group, "hooks": kept})
+        if cleaned:
+            hooks[event] = cleaned
+        else:
+            hooks.pop(event, None)
+    if install:
+        for event, group in codex_groups().items():
+            hooks.setdefault(event, []).append(group)
+    return result
+
+
+def merge_dsh(text, install=True):
+    pattern = re.compile(r"(?m)^" + re.escape(BEGIN) + r"\n.*?^" + re.escape(END) + r"\n?", re.S)
+    text = pattern.sub("", text).rstrip() + "\n"
+    if not install:
+        return text
+    plugin = ROOT / 'integrations/dsh/index.mjs'
+    version = hashlib.sha256(plugin.read_bytes()).hexdigest()[:16]
+    module_path = MODULES / ('agentping-' + version + '.mjs')
+    block = (f"{BEGIN}\n- insert:\n    - id: agentping-notifications-{version}\n"
+             f"      name: {json.dumps(str(module_path))}\n"
+             f"      config:\n        receiver: {json.dumps(str(RECEIVER))}\n"
+             f"        python: {json.dumps(sys.executable)}\n{END}\n")
+    return text + block
+
+
+def prepare_dsh_module():
+    plugin = ROOT / 'integrations/dsh/index.mjs'
+    data = plugin.read_bytes()
+    version = hashlib.sha256(data).hexdigest()[:16]
+    MODULES.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = MODULES / ('agentping-' + version + '.mjs')
+    if not target.exists():
+        target.write_bytes(data)
+        target.chmod(0o600)
+
+
+def backup(path):
+    BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    target = BACKUPS / f"{stamp}-{path.parent.name}-{path.name}"
+    if path.exists():
+        shutil.copy2(path, target)
+        target.chmod(0o600)
+
+
+def write(path, text):
+    backup(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".agentping.tmp")
+    temp.write_text(text, encoding="utf-8")
+    temp.chmod(0o600)
+    temp.replace(path)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--uninstall", action="store_true")
+    p.add_argument("--check", action="store_true")
+    args = p.parse_args()
+    if args.check:
+        print(json.dumps({"codexConfigured": CODEX_PATH.exists() and str(RECEIVER) in CODEX_PATH.read_text(),
+                          "dshConfigured": DSH_PATH.exists() and BEGIN in DSH_PATH.read_text(),
+                          "codexTrust": "请在 Codex Settings > Hooks / CLI /hooks 中检查信任状态"}, ensure_ascii=False, indent=2))
+        return
+    if not DSH_PATH.is_file():
+        raise ValueError("未找到 DSH desktop profile，未修改配置")
+    old_codex = json.loads(CODEX_PATH.read_text()) if CODEX_PATH.exists() else {}
+    new_codex = json.dumps(merge_codex(old_codex, not args.uninstall), ensure_ascii=False, indent=2) + "\n"
+    new_dsh = merge_dsh(DSH_PATH.read_text(), not args.uninstall)
+    if not args.uninstall:
+        prepare_dsh_module()
+    write(CODEX_PATH, new_codex)
+    write(DSH_PATH, new_dsh)
+    print("已移除 AgentPing 的 Codex / DSH 条目" if args.uninstall else "已安装 Codex / DSH 条目；Codex 新 hook 必须审阅信任后才会执行")
+    print("既有 notify / 其他 hook / 飞书配置未改动；配置备份位于", BACKUPS)
+
+
+if __name__ == "__main__":
+    main()
